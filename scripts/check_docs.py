@@ -6,16 +6,19 @@
 
 --render  ลองวาดผัง Mermaid ทุกผังด้วย Chrome หรือ Edge ในเครื่อง (ต้องมีอินเทอร์เน็ต)
 
-รหัสออก: 0 = ไม่มีรายการระดับผิดพลาด, 1 = มีรายการระดับผิดพลาด, 2 = เรียกใช้ผิด
+Python 3.9+ ใช้ไลบรารีมาตรฐาน ต้องมี blueprint.json ตาม references/file-set.md
+รหัสออก: 0 = ไม่พบข้อผิดพลาดเชิงกลไก (อาจมีคำเตือน/สิ่งที่ไม่ได้ตรวจ), 1 = พบข้อผิดพลาด, 2 = เรียกใช้ผิด
 """
 import html
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from urllib.parse import unquote, urlsplit
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -25,6 +28,9 @@ except Exception:
 errors = []    # (file, line, message)
 warnings = []  # (file, line, message)
 notes = []     # ข้อความแจ้งทั่วไป
+BASE_ROLES = {"source", "overview", "features", "flows", "decisions", "development_plan", "acceptance"}
+TECH_ROLES = {"architecture", "data_model", "api"}
+DECISION_STATUSES = {"ตัดสินใจแล้ว", "ใช้ค่าที่เสนอไปก่อน รอยืนยันกับลูกค้า", "รอตัดสินใจ"}
 
 
 def err(f, line, msg):
@@ -37,7 +43,7 @@ def warn(f, line, msg):
 
 # ---------- อ่านไฟล์และแยกส่วนที่เป็นโค้ด ----------
 
-FENCE = re.compile(r"^\s*(```|~~~)")
+FENCE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 HEADING = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
 NUM_TOKEN = re.compile(r"^(\d+(?:\.\d+)*)\.?(?=\s|$|:)")
 LIST_NUM = re.compile(r"^\s*[-*]\s+(\d+(?:\.\d+)+)\s")
@@ -47,12 +53,13 @@ class Doc:
     def __init__(self, path, root):
         self.path = path
         self.rel = path.relative_to(root).as_posix()
-        self.text = path.read_text(encoding="utf-8", errors="replace")
+        self.text = path.read_text(encoding="utf-8")
         self.lines = self.text.splitlines()
         self.in_code = []          # แต่ละบรรทัดอยู่ในบล็อกโค้ดหรือไม่
         self.headings = []         # (line_no, level, text)
         self.mermaid = []          # (start_line, code)
         self.fence_count = 0
+        self.role = None
         self._scan()
 
     def _scan(self):
@@ -60,19 +67,27 @@ class Doc:
         lang = ""
         buf = []
         start = 0
+        marker = ""
+        length = 0
         for i, line in enumerate(self.lines, 1):
-            if FENCE.match(line):
-                self.fence_count += 1
+            fence = FENCE.match(line)
+            if fence:
                 if not inside:
+                    self.fence_count += 1
                     inside = True
-                    lang = line.strip().lstrip("`~").strip().lower()
+                    marker = fence.group(1)[0]
+                    length = len(fence.group(1))
+                    lang = fence.group(2).strip().lower()
                     buf = []
                     start = i
-                else:
+                elif fence.group(1)[0] == marker and len(fence.group(1)) >= length and not fence.group(2).strip():
+                    self.fence_count += 1
                     if lang == "mermaid":
                         self.mermaid.append((start, "\n".join(buf)))
                     inside = False
                     lang = ""
+                else:
+                    buf.append(line)
                 self.in_code.append(True)
                 continue
             self.in_code.append(inside)
@@ -129,6 +144,90 @@ def check_structure(root):
         err("plans/", 0, "โฟลเดอร์ plans/ ไม่มีไฟล์ .md")
 
 
+def check_manifest(root):
+    """Return validated role/path pairs; report malformed data without guessing a mode."""
+    path = root / "blueprint.json"
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        err("blueprint.json", 0, f"อ่านทะเบียนไม่ได้: {e}; สร้างตาม references/file-set.md")
+        return {}
+    if not isinstance(config, dict):
+        err("blueprint.json", 0, "ทะเบียนต้องเป็น JSON object")
+        return {}
+    if type(config.get("schema_version")) is not int or config["schema_version"] != 1:
+        err("blueprint.json", 0, "schema_version ต้องเป็นจำนวนเต็ม 1")
+    mode = config.get("mode")
+    if mode not in ("business", "full"):
+        err("blueprint.json", 0, "mode ต้องเป็น business หรือ full")
+    documents = config.get("documents")
+    if not isinstance(documents, dict):
+        err("blueprint.json", 0, "documents ต้องเป็น object บทบาท: path")
+        documents = {}
+    omissions = config.get("omissions", {})
+    if not isinstance(omissions, dict):
+        err("blueprint.json", 0, "omissions ต้องเป็น object")
+        omissions = {}
+    if set(omissions) - {"api"}:
+        err("blueprint.json", 0, "เว้นได้เฉพาะบทบาท api ใน full พร้อมเหตุผล")
+    if omissions and (mode != "full" or "api" in documents):
+        err("blueprint.json", 0, "omissions.api ใช้เฉพาะ full ที่ไม่มีบทบาท api")
+    if "api" in omissions and (not isinstance(omissions["api"], str) or not omissions["api"].strip()):
+        err("blueprint.json", 0, "omissions.api ต้องมีเหตุผลเป็นข้อความที่ไม่ว่าง")
+    required = BASE_ROLES | ({"architecture", "data_model"} if mode == "full" else set())
+    if mode == "full" and "api" not in omissions:
+        required.add("api")
+    for role in sorted(required - set(documents)):
+        err("blueprint.json", 0, f"ขาดบทบาทเอกสารจำเป็น: {role}")
+    if mode == "business" and TECH_ROLES & set(documents):
+        err("blueprint.json", 0, "business ต้องไม่มีบทบาท architecture, data_model หรือ api")
+    plans = config.get("plans")
+    if not isinstance(plans, list) or not plans:
+        err("blueprint.json", 0, "plans ต้องเป็นรายการ path ของแผนอย่างน้อยหนึ่งไฟล์")
+        plans = []
+    registered = set()
+    valid_roles = {}
+
+    def register(value, folder):
+        if not isinstance(value, str) or not value.strip():
+            err("blueprint.json", 0, "path ต้องเป็นข้อความที่ไม่ว่าง")
+            return False
+        parts = PurePosixPath(value).parts
+        if ("\\" in value or value != PurePosixPath(value).as_posix() or
+                len(parts) < 2 or parts[0] != folder or ".." in parts or
+                not value.endswith(".md")):
+            err("blueprint.json", 0, f"path ไม่ถูกต้องสำหรับ {folder}/: {value}")
+            return False
+        try:
+            (root / value).resolve().relative_to(root.resolve())
+        except ValueError:
+            err("blueprint.json", 0, f"path ชี้ออกนอกโครงการ: {value}")
+            return False
+        if value in registered:
+            err("blueprint.json", 0, f"path ในทะเบียนซ้ำ: {value}")
+        registered.add(value)
+        if not (root / value).is_file():
+            err("blueprint.json", 0, f"ไม่พบไฟล์ในทะเบียน: {value}")
+        if folder == "docs" and not re.fullmatch(r"docs/\d\d-[a-z0-9][a-z0-9-]*\.md", value):
+            err("blueprint.json", 0, f"ชื่อ docs ต้องเป็นเลข 2 หลัก-ชื่อภาษาอังกฤษ.md: {value}")
+        return True
+
+    for role, value in documents.items():
+        if not isinstance(role, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", role):
+            err("blueprint.json", 0, f"ชื่อบทบาทไม่ถูกต้อง: {role}")
+        if register(value, "docs"):
+            valid_roles[role] = value
+            if mode == "business" and re.search(r"-(architecture|data-model|api-spec)\.md$", value):
+                err("blueprint.json", 0, f"business ไม่ควรมีไฟล์เทคนิค: {value}")
+    for value in plans:
+        register(value, "plans")
+    for folder in ("docs", "plans"):
+        for p in (root / folder).rglob("*.md"):
+            if p.relative_to(root).as_posix() not in registered:
+                err("blueprint.json", 0, f"ไฟล์ไม่ได้อยู่ในทะเบียน: {p.relative_to(root).as_posix()}")
+    return valid_roles
+
+
 def check_numbering(root):
     docs = root / "docs"
     if not docs.is_dir():
@@ -137,7 +236,7 @@ def check_numbering(root):
     for p in sorted(docs.glob("*.md")):
         m = re.match(r"^(\d\d)-[a-z0-9][a-z0-9-]*\.md$", p.name)
         if not m:
-            warn(f"docs/{p.name}", 0, "ชื่อไฟล์ไม่ได้อยู่ในรูปแบบ เลข 2 หลัก-ชื่อตัวพิมพ์เล็กคั่นด้วยขีดกลาง.md")
+            err(f"docs/{p.name}", 0, "ชื่อไฟล์ไม่ได้อยู่ในรูปแบบ เลข 2 หลัก-ชื่อตัวพิมพ์เล็กคั่นด้วยขีดกลาง.md")
             continue
         seen.setdefault(int(m.group(1)), []).append(p.name)
     if not seen:
@@ -146,8 +245,8 @@ def check_numbering(root):
         if len(names) > 1:
             err("docs/", 0, f"เลขนำหน้า {n:02d} ซ้ำกัน: {', '.join(names)}")
     nums = sorted(seen)
-    if nums[0] not in (0, 1):
-        err("docs/", 0, f"เลขนำหน้าไฟล์ควรเริ่มที่ 00 หรือ 01 แต่เริ่มที่ {nums[0]:02d}")
+    if nums[0] != 0:
+        err("docs/", 0, f"เลขนำหน้าไฟล์ควรเริ่มที่ 00 แต่เริ่มที่ {nums[0]:02d}")
     for a, b in zip(nums, nums[1:]):
         if b != a + 1:
             err("docs/", 0, f"เลขนำหน้าไฟล์ข้ามจาก {a:02d} ไป {b:02d}")
@@ -169,7 +268,7 @@ def check_fences(docs):
 
 
 FILE_TOKEN = re.compile(r"(?<![\w/.-])((?:[\w.-]+/)*[\w.-]+\.md)(?![\w-])")
-MD_LINK = re.compile(r"\]\(([^)\s]+)\)")
+MD_LINK = re.compile(r"!?\[[^\]]*\]\((?:<([^>]+)>|([^\s)]+))(?:\s+\"[^\"]*\")?\)")
 
 
 def resolve(root, doc, token):
@@ -181,7 +280,7 @@ def resolve(root, doc, token):
 
 
 def is_source_doc(d):
-    return d.path.name.startswith("00-")
+    return d.role == "source"
 
 
 def check_file_refs(root, docs):
@@ -195,7 +294,12 @@ def check_file_refs(root, docs):
         if is_source_doc(d):
             continue
         for i, line in d.prose_lines():
+            links = list(MD_LINK.finditer(line))
             for m in FILE_TOKEN.finditer(line):
+                if any(link.start() <= m.start() < link.end() for link in links):
+                    continue  # labels are not paths; actual Markdown targets are checked below
+                if re.search(r"[a-z][a-z0-9+.-]*://[^\s]*$", line[:m.start()], re.I):
+                    continue
                 tok = m.group(1)
                 if any(c in tok for c in "<>*{}"):
                     continue
@@ -203,11 +307,17 @@ def check_file_refs(root, docs):
                     continue
                 if not resolve(root, d, tok):
                     err(d.rel, i, f"อ้างถึงไฟล์ที่ไม่มีอยู่: {tok}")
-            for m in MD_LINK.finditer(line):
-                target = m.group(1)
-                if re.match(r"^[a-z][a-z0-9+.-]*:", target) or target.startswith("#"):
+            for m in links:
+                target = unquote(m.group(1) or m.group(2))
+                try:
+                    parts = urlsplit(target)
+                except ValueError:
+                    err(d.rel, i, f"รูปแบบลิงก์ไม่ถูกต้อง: {target}")
                     continue
-                if not resolve(root, d, target):
+                if parts.scheme or parts.netloc or not parts.path:
+                    continue
+                # Markdown links resolve relative to the referring file, not to docs/ or the project root.
+                if not (d.path.parent / parts.path).is_file():
                     err(d.rel, i, f"ลิงก์ชี้ไปยังไฟล์ที่ไม่มีอยู่: {target}")
 
 
@@ -237,8 +347,8 @@ def check_section_refs(root, docs):
     by_name = {}
     for d in docs:
         by_name.setdefault(d.path.name, d)
-    flows = [d for d in docs if "flow" in d.path.name.lower()]
-    decisions = [d for d in docs if "decision" in d.path.name.lower()]
+    flows = [d for d in docs if d.role == "flows"]
+    decisions = [d for d in docs if d.role == "decisions"]
     flow_nums = set()
     for d in flows:
         for _, _, text in d.headings:
@@ -248,6 +358,8 @@ def check_section_refs(root, docs):
         decision_nums |= d.heading_numbers()
 
     for d in docs:
+        if is_source_doc(d):
+            continue
         for i, line in d.prose_lines():
             for m in SECTION_REF.finditer(line):
                 target = by_name.get(Path(m.group(1)).name)
@@ -257,14 +369,12 @@ def check_section_refs(root, docs):
                 for n in parse_numbers(line[m.end():m.end() + 60]):
                     if n not in have:
                         err(d.rel, i, f"อ้างถึง {target.path.name} ข้อ {n} แต่ไฟล์นั้นไม่มีหัวข้อเลข {n}")
-            if flows:
-                for n in re.findall(r"\bFlow\s+(\d+)", line):
-                    if n not in flow_nums:
-                        err(d.rel, i, f"อ้างถึง Flow {n} แต่ไฟล์ลำดับการทำงานไม่มีหัวข้อ Flow {n}")
-            if decisions:
-                for n in re.findall(r"ประเด็นที่\s+(\d+)", line):
-                    if n not in decision_nums:
-                        err(d.rel, i, f"อ้างถึงประเด็นที่ {n} แต่ไฟล์ประเด็นตัดสินใจไม่มีหัวข้อเลข {n}")
+            for n in re.findall(r"\bFlow\s+(\d+)", line):
+                if n not in flow_nums:
+                    err(d.rel, i, f"อ้างถึง Flow {n} แต่ไฟล์ลำดับการทำงานไม่มีหัวข้อ Flow {n}")
+            for n in re.findall(r"ประเด็นที่\s+(\d+)", line):
+                if n not in decision_nums:
+                    err(d.rel, i, f"อ้างถึงประเด็นที่ {n} แต่ไฟล์ประเด็นตัดสินใจไม่มีหัวข้อเลข {n}")
 
 
 def check_readme_lists_files(root, docs):
@@ -275,9 +385,11 @@ def check_readme_lists_files(root, docs):
         folder = root / sub
         if not folder.is_dir():
             continue
-        for p in sorted(folder.glob("*.md")):
+        for p in sorted(folder.rglob("*.md")):
             if p.name not in readme.text:
                 err("README.md", 0, f"README ไม่ได้กล่าวถึงไฟล์ {sub}/{p.name}")
+    if "blueprint.json" not in readme.text:
+        err("README.md", 0, "README ไม่ได้กล่าวถึงทะเบียน blueprint.json")
 
 
 CODE = re.compile(r"(?<![\w-])([A-Z]{1,4}(?:-[A-Z]{1,3})?)-([A-Z]?\d{1,4})(?![\w-])")
@@ -315,6 +427,11 @@ HTML_TAGS = {"br", "b", "i", "u", "em", "strong", "sub", "sup", "kbd", "span", "
 
 def check_leftovers(docs):
     for d in docs:
+        if is_source_doc(d):
+            continue  # ต้นทางเก็บตามที่ได้รับ ไม่แก้ placeholder ที่เป็นส่วนหนึ่งของต้นฉบับ
+        for i, line in enumerate(d.lines, 1):
+            if re.search(r"\{\{[a-z_]+\}\}", line):
+                err(d.rel, i, "ยังไม่ได้แทนชื่อบทบาท {{role}} ด้วย path จริงจากทะเบียน")
         for i, line in d.prose_lines():
             clean = strip_inline_code(line)
             m = LEFTOVER.search(clean)
@@ -329,6 +446,13 @@ def check_leftovers(docs):
 
 def check_empty_sections(docs):
     for d in docs:
+        text = re.sub(r"<!--.*?-->", "", d.text, flags=re.S)
+        body_lines = [line for line in text.splitlines()
+                      if line.strip() and not HEADING.match(line)
+                      and line.strip() not in ("---", "***", "___")
+                      and not FENCE.match(line)]
+        if not body_lines:
+            err(d.rel, 0, "เอกสารว่างหรือมีแต่หัวข้อ ไม่มีเนื้อหา")
         hs = d.headings
         for idx, (line_no, level, text) in enumerate(hs):
             end = hs[idx + 1][0] - 1 if idx + 1 < len(hs) else len(d.lines)
@@ -347,7 +471,7 @@ CLIENT_MARK = re.compile(r"\(ลูกค้ากำหนด\)")
 
 
 def check_pending_marks(docs):
-    decisions = [d for d in docs if "decision" in d.path.name.lower()]
+    decisions = [d for d in docs if d.role == "decisions"]
     marked = [
         d for d in docs
         if (PENDING_MARK.search(d.text) or CLIENT_MARK.search(d.text))
@@ -401,19 +525,60 @@ def check_wide_tables(docs):
 def check_decision_summary(docs):
     """ตารางสรุปประเด็นต้องมีเลขตรงกับหัวข้อประเด็นจริง"""
     for d in docs:
-        if "decision" not in d.path.name.lower():
+        if d.role != "decisions":
             continue
         heading_nums = {n for n in d.heading_numbers() if n.isdigit()}
-        if not heading_nums:
-            continue
-        first_numbered = min(l for l, _, t in d.headings if NUM_TOKEN.match(t))
+        first_numbered = min((l for l, _, t in d.headings if NUM_TOKEN.match(t)), default=len(d.lines) + 1)
         summary_nums = {r[0] for r in table_rows(d, 0, first_numbered - 1) if r and r[0].isdigit()}
+        if not heading_nums and not summary_nums:
+            continue  # ไม่มีประเด็นจริง ต้องอธิบายไว้ในเนื้อหาแทนการสร้างประเด็นปลอม
         if not summary_nums:
-            continue
+            err(d.rel, 0, "มีหัวข้อประเด็น แต่ไม่มีตารางสรุปเลขประเด็น")
         for n in sorted(heading_nums - summary_nums, key=int):
             err(d.rel, 0, f"ประเด็นที่ {n} มีหัวข้อ แต่ไม่อยู่ในตารางสรุปประเด็น")
         for n in sorted(summary_nums - heading_nums, key=int):
             err(d.rel, 0, f"ตารางสรุปประเด็นมีประเด็นที่ {n} แต่ไม่มีหัวข้อของประเด็นนั้น")
+
+
+def check_decision_statuses(docs):
+    for d in docs:
+        if d.role != "decisions":
+            continue
+        summary = {}
+        for row in table_rows(d, 0, len(d.lines)):
+            if len(row) >= 3 and row[0].isdigit():
+                summary[row[0]] = row[2].strip("*` ")
+        headings = [(line, text) for line, _, text in d.headings
+                    if NUM_TOKEN.match(text) and NUM_TOKEN.match(text).group(1).isdigit()]
+        for idx, (line, text) in enumerate(headings):
+            number = NUM_TOKEN.match(text).group(1)
+            end = headings[idx + 1][0] - 1 if idx + 1 < len(headings) else len(d.lines)
+            block = "\n".join(d.lines[line:end])
+            match = re.search(r"^\*\*สถานะ:\*\*\s*([^\n(]+)", block, re.M)
+            status = match.group(1).strip("*` ") if match else ""
+            if status not in DECISION_STATUSES:
+                err(d.rel, line, f"ประเด็นที่ {number} ไม่มีสถานะที่กำหนด หรือใช้สถานะไม่ถูกต้อง: {status or '(ไม่มี)'}")
+            if number in summary and summary[number] != status:
+                err(d.rel, line, f"สถานะประเด็นที่ {number} ไม่ตรงกับตารางสรุป")
+            if status == "ตัดสินใจแล้ว":
+                for label in ("ผู้ยืนยัน", "วันที่ยืนยัน", "หลักฐานยืนยัน"):
+                    field = re.search(r"^\*\*" + label + r":\*\*\s*([^\n]+)", block, re.M)
+                    value = field.group(1).strip() if field else ""
+                    if not value or value in {"-", "รอระบุ", "ยังไม่ระบุ", "ยังไม่ยืนยัน", "ไม่ทราบ"}:
+                        err(d.rel, line, f"ประเด็นที่ {number} ตัดสินใจแล้วแต่ขาด {label}")
+
+
+def check_duplicate_numbers(docs):
+    for d in docs:
+        if is_source_doc(d):
+            continue
+        seen = set()
+        for line, _, title in d.headings:
+            m = NUM_TOKEN.match(title)
+            if m:
+                if m.group(1) in seen:
+                    err(d.rel, line, f"เลขหัวข้อซ้ำ: {m.group(1)}")
+                seen.add(m.group(1))
 
 
 def actual_counts(docs):
@@ -423,12 +588,12 @@ def actual_counts(docs):
     for d in docs:
         if not is_source_doc(d) and d.rel != "README.md":
             total_pending_marks += len(PENDING_MARK.findall(d.text))
-        name = d.path.name.lower()
-        if "flow" in name:
+        role = d.role
+        if role == "flows":
             flows = {n for _, _, t in d.headings for n in re.findall(r"\bFlow\s+(\d+)", t)}
             if flows:
                 out.append(f"{d.rel}: Flow {len(flows)} เรื่อง")
-        if "decision" in name:
+        if role == "decisions":
             nums = [n for n in d.heading_numbers() if n.isdigit()]
             statuses = {}
             unresolved = 0
@@ -443,10 +608,8 @@ def actual_counts(docs):
                 detail = ", ".join(f"{k} {v}" for k, v in sorted(statuses.items()))
                 ratio = (unresolved / len(nums)) * 100
                 extra = f" — รอยืนยัน/รอตัดสินใจ {ratio:.0f}%"
-                if ratio > 40:
-                    extra += " (เกิน 40% ควรระบุคำเตือนใน README.md หัวข้อข้อควรรู้ก่อนอ่าน)"
                 out.append(f"{d.rel}: ประเด็น {len(nums)} เรื่อง" + (f" ({detail}){extra}" if detail else ""))
-        if "screen" in name:
+        if role == "screens":
             hs = d.headings
             total = 0
             parts = []
@@ -458,11 +621,11 @@ def actual_counts(docs):
                     total += len(rows)
             if total:
                 out.append(f"{d.rel}: แถวที่มีเลขลำดับ {total} แถว ({'; '.join(parts)})")
-        if "api" in name:
+        if role == "api":
             methods = sum(1 for line in d.lines if re.match(r"^\s*\|\s*(GET|POST|PUT|PATCH|DELETE)\b", line))
             if methods:
                 out.append(f"{d.rel}: แถว API {methods} แถว")
-        if "data-model" in name or "data_model" in name:
+        if role == "data_model":
             entities = [t for _, level, t in d.headings if level == 3 and re.match(r"^[A-Z][A-Z0-9_]+\b", t)]
             if entities:
                 out.append(f"{d.rel}: Entity {len(entities)} รายการ")
@@ -543,20 +706,34 @@ def render_mermaid(docs):
         notes.append("ข้ามการวาดผัง Mermaid: โหลดตัววาดผังจากอินเทอร์เน็ตไม่สำเร็จ")
         return
     ok = 0
+    received = set()
     for item in result.split("||"):
         key, _, status = item.partition("=")
+        if not re.fullmatch(r"d\d+", key) or int(key[1:]) >= len(blocks):
+            err("Mermaid", 0, "ผลจากเบราว์เซอร์ไม่ถูกต้องหรือไม่ครบ")
+            continue
         n = int(key[1:])
+        if n in received:
+            err("Mermaid", 0, f"ผลการวาดผัง d{n} ซ้ำ")
+            continue
+        received.add(n)
         rel, start, _ = blocks[n]
         if status == "ok":
             ok += 1
         else:
             err(rel, start, f"ผัง Mermaid วาดไม่ได้: {status[4:]}")
+    for n in set(range(len(blocks))) - received:
+        rel, start, _ = blocks[n]
+        err(rel, start, "ไม่มีผลตรวจการวาดผังนี้จากเบราว์เซอร์")
     notes.append(f"วาดผัง Mermaid ได้ {ok} จาก {len(blocks)} ผัง")
 
 
 # ---------- หลัก ----------
 
 def main():
+    errors.clear()
+    warnings.clear()
+    notes.clear()
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
     if len(args) != 1 or flags - {"--render"}:
@@ -568,6 +745,7 @@ def main():
         return 2
 
     check_structure(root)
+    roles = check_manifest(root)
     check_numbering(root)
 
     paths = []
@@ -576,7 +754,17 @@ def main():
     for sub in ("docs", "plans"):
         if (root / sub).is_dir():
             paths.extend(sorted((root / sub).rglob("*.md")))
-    docs = [Doc(p, root) for p in paths]
+    docs = []
+    by_path = {path: role for role, path in roles.items()}
+    for p in paths:
+        try:
+            p.resolve().relative_to(root)
+            d = Doc(p, root)
+        except (OSError, ValueError) as e:
+            err(p.relative_to(root).as_posix(), 0, f"อ่านเอกสารไม่ได้หรือชี้ออกนอกโครงการ: {e}")
+            continue
+        d.role = by_path.get(d.rel)
+        docs.append(d)
 
     check_fences(docs)
     check_file_refs(root, docs)
@@ -588,6 +776,8 @@ def main():
     check_pending_marks(docs)
     check_wide_tables(docs)
     check_decision_summary(docs)
+    check_decision_statuses(docs)
+    check_duplicate_numbers(docs)
     if "--render" in flags:
         render_mermaid(docs)
 
@@ -611,7 +801,7 @@ def main():
 
     show("ผิดพลาด", errors)
     show("เตือน", warnings)
-    print("\nผล: " + ("ไม่ผ่าน ต้องแก้รายการระดับผิดพลาด" if errors else "ผ่านการตรวจด้วยสคริปต์"))
+    print("\nผล: " + ("ไม่ผ่าน ต้องแก้รายการระดับผิดพลาด" if errors else "ผ่านการตรวจเชิงกลไก ต้องรีวิวเนื้อหาและสิ่งที่ยังไม่ได้ตรวจแยกต่างหาก"))
     return 1 if errors else 0
 
 
