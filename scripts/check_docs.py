@@ -275,8 +275,10 @@ def resolve(root, doc, token):
     token = token.split("#")[0]
     if not token:
         return True
+    if "/" in token:
+        return any((b / token).is_file() for b in (root, doc.path.parent))
     bases = [root, doc.path.parent, root / "docs", root / "plans"]
-    return any((b / token).exists() for b in bases)
+    return any((b / token).is_file() for b in bases)
 
 
 def is_source_doc(d):
@@ -386,8 +388,18 @@ def check_readme_lists_files(root, docs):
         if not folder.is_dir():
             continue
         for p in sorted(folder.rglob("*.md")):
-            if p.name not in readme.text:
-                err("README.md", 0, f"README ไม่ได้กล่าวถึงไฟล์ {sub}/{p.name}")
+            rel = p.relative_to(root).as_posix()
+            if rel not in readme.text and p.name not in readme.text:
+                err("README.md", 0, f"README ไม่ได้กล่าวถึงไฟล์ {rel}")
+    for i, line in enumerate(readme.lines, 1):
+        if not readme.in_code[i - 1]:
+            continue
+        for m in FILE_TOKEN.finditer(line):
+            tok = m.group(1)
+            if any(c in tok for c in "<>*{}"):
+                continue
+            if not resolve(root, readme, tok):
+                err("README.md", i, f"แผนผังหรือบล็อกโค้ดใน README อ้างถึงไฟล์ที่ไม่มีอยู่จริง: {tok}")
     if "blueprint.json" not in readme.text:
         err("README.md", 0, "README ไม่ได้กล่าวถึงทะเบียน blueprint.json")
 
@@ -560,6 +572,13 @@ def check_decision_statuses(docs):
                 err(d.rel, line, f"ประเด็นที่ {number} ไม่มีสถานะที่กำหนด หรือใช้สถานะไม่ถูกต้อง: {status or '(ไม่มี)'}")
             if number in summary and summary[number] != status:
                 err(d.rel, line, f"สถานะประเด็นที่ {number} ไม่ตรงกับตารางสรุป")
+            if "**ทางเลือกและผลกระทบ**" not in block:
+                err(d.rel, line, f"ประเด็นที่ {number} ขาดหัวข้อ **ทางเลือกและผลกระทบ**")
+            for label in ("ที่มา", "ค่าที่ใช้ในเอกสาร / คำแนะนำของทีม", "ผลกระทบเมื่อคำตอบเปลี่ยน"):
+                field = re.search(r"^\*\*" + re.escape(label) + r":\*\*\s*([^\n]+)", block, re.M)
+                value = field.group(1).strip() if field else ""
+                if not value or value == "-":
+                    err(d.rel, line, f"ประเด็นที่ {number} ขาดรายละเอียด {label}")
             if status == "ตัดสินใจแล้ว":
                 for label in ("ผู้ยืนยัน", "วันที่ยืนยัน", "หลักฐานยืนยัน"):
                     field = re.search(r"^\*\*" + label + r":\*\*\s*([^\n]+)", block, re.M)

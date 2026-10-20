@@ -177,15 +177,36 @@ class CheckDocsTests(ProjectCase):
         self.save()
         self.run_check(0)
 
-    def decision(self, status, evidence=""):
+    def decision(self, status, evidence="", details=None):
+        if details is None:
+            details = (
+                "**ที่มา:** Source requirement did not specify loan duration.\n"
+                "**ทางเลือกและผลกระทบ**\n"
+                "- **ทางเลือก ก:** 7 days\n"
+                "- **ทางเลือก ข:** 14 days\n"
+                "**ค่าที่ใช้ในเอกสาร / คำแนะนำของทีม:** 7 days\n"
+                "**ผลกระทบเมื่อคำตอบเปลี่ยน:** 03-flows.md Flow 1\n"
+            )
         self.document("decisions").write_text(
             "# Decisions\n## Summary\n| # | Topic | Status |\n|---|---|---|\n"
-            "| 1 | Duration | " + status + " |\n## 1. Duration\n**สถานะ:** " + status + "\n" + evidence,
+            "| 1 | Duration | " + status + " |\n## 1. Duration\n**สถานะ:** " + status + "\n" + details + evidence,
             encoding="utf-8")
 
     def test_pending_decision_is_valid(self):
         self.decision("ใช้ค่าที่เสนอไปก่อน รอยืนยันกับลูกค้า")
         self.run_check(0)
+
+    def test_decision_missing_required_details_fails(self):
+        self.decision("ใช้ค่าที่เสนอไปก่อน รอยืนยันกับลูกค้า", details="**ที่มา:** Chat.\n")
+        self.run_check(1)
+
+    def test_readme_code_block_with_wrong_file_or_folder_fails(self):
+        readme = self.root / "README.md"
+        base = readme.read_text(encoding="utf-8")
+        for bad in ("docs/next-step.md", "docs/99-ghost.md"):
+            with self.subTest(bad=bad):
+                readme.write_text(base + f"\n```text\n{bad}\n```\n", encoding="utf-8")
+                self.run_check(1)
 
     def test_confirmed_decision_needs_evidence(self):
         self.decision("ตัดสินใจแล้ว")
