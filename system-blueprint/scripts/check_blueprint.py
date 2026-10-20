@@ -3,12 +3,18 @@
 ใช้: python check_blueprint.py <โฟลเดอร์ *-blueprint>
 
 ตรวจ:
-  - เลขอ้างอิงที่ถูกอ้างถึง แต่ไม่มีในไฟล์หลักของตัวอักษรนั้น (ผิดพลาด)
-  - รายการในไฟล์หลักที่ไม่มีไฟล์อื่นอ้างถึงเลย (เตือน)
-  - ตารางเกิน 5 คอลัมน์ (ผิดพลาด)
+  - ไฟล์ที่ต้องมีตามโหมด (ฉบับย่อ/ฉบับเต็ม) หายไป (ผิดพลาด) และไฟล์ที่ไม่รู้จัก (เตือน)
+  - เลขอ้างอิงที่ถูกอ้างถึง แต่ไม่ได้ประกาศในไฟล์หลักของตัวอักษรนั้น (ผิดพลาด)
+    "ประกาศ" = เลขอยู่ต้นช่องแรกของแถวตาราง หรือต้นหัวข้อ (#) ในไฟล์หลัก
+    การเอ่ยถึงที่อื่นในไฟล์หลักเองนับเป็นการอ้างถึง
+  - เลขเดียวกันประกาศซ้ำ (ผิดพลาด)
+  - รายการที่ควรถูกอ้างถึงแต่ไม่มีไฟล์อื่นอ้างเลย (เตือน)
+  - ตารางเกิน 5 คอลัมน์ ตรวจทุกแถว รวมตารางที่ไม่มี | นำหน้า (ผิดพลาด)
   - บล็อกโค้ดในเอกสารหลัก (ผิดพลาด)
-  - ป้าย [รอตัดสินใจ] ที่ไม่มีเลข T-xx (ผิดพลาด)
+  - ป้ายสถานะผิดรูปแบบ หรือ [รอตัดสินใจ] ที่ไม่มีเลข T-xx (ผิดพลาด)
+  - รายการที่ประกาศแล้วไม่มีป้ายสถานะในบรรทัดเดียวกัน (เตือน)
   - นับป้ายสถานะ และสัดส่วนข้อสมมติ สำหรับใส่ใน 00-readme
+    (ไม่นับใน 00 และ 14 เพราะเป็นคำอธิบายป้าย ไม่ใช่รายการของระบบ)
 
 ใช้ไลบรารีมาตรฐานเท่านั้น ออกจากโปรแกรมด้วยรหัส 1 ถ้ามีข้อผิดพลาด
 """
@@ -17,7 +23,29 @@ import re
 import sys
 from pathlib import Path
 
-# ไฟล์หลักของแต่ละตัวอักษร: (ฉบับเต็ม, ฉบับย่อ)
+FILES = {
+    "00": "00-readme.md",
+    "01": "01-overview.md",
+    "02": "02-users-and-roles.md",
+    "03": "03-features.md",
+    "04": "04-workflow.md",
+    "05": "05-data.md",
+    "06": "06-quality-requirements.md",
+    "07": "07-integrations.md",
+    "08": "08-constraints-and-rules.md",
+    "09": "09-system-diagram.md",
+    "10": "10-screens.md",
+    "11": "11-risks-and-assumptions.md",
+    "12": "12-acceptance-criteria.md",
+    "13": "13-open-decisions.md",
+    "14": "14-glossary.md",
+    "15": "15-summary.md",
+}
+SHORT_ONLY_MISSING = {"05", "07", "10", "11", "12"}  # ไฟล์ที่ฉบับย่อไม่จัดทำ
+APPENDIX_RE = re.compile(r"^(99-|09a-)")
+
+# ไฟล์หลักของแต่ละตัวอักษร: (ฉบับเต็ม, ฉบับย่อ) ใช้ฉบับเต็มถ้าไฟล์นั้นมีอยู่
+# จึงรองรับชุดที่กำลังอัปเกรดค้างครึ่งทางด้วย
 HOME = {
     "G": ("01", "01"),
     "U": ("02", "02"),
@@ -33,12 +61,31 @@ HOME = {
     "T": ("13", "13"),
 }
 # ตัวอักษรที่ควรถูกอ้างจากไฟล์อื่นอย่างน้อยหนึ่งครั้ง
-SHOULD_BE_REFERENCED = {"U", "F", "D", "I", "G"}
+SHOULD_BE_REFERENCED = {"G", "U", "F", "P", "D", "Q", "I", "A", "T"}
+# ตัวอักษรที่บรรทัดประกาศไม่ต้องมีป้าย (T มีสถานะในเนื้อหัวข้อ)
+NO_LABEL_NEEDED = {"T"}
+# ไฟล์ที่ป้ายเป็นคำอธิบาย ไม่นับสัดส่วน
+NOT_COUNTED = {"00", "14"}
 
 ID_RE = re.compile(r"(?<![A-Za-z0-9-])([GUFPBDQICRAT])-(\d{2,3})(?![0-9])")
+BAD_ID_RE = re.compile(r"(?<![A-Za-z0-9-])([GUFPBDQICRAT])-(\d)(?![0-9])")
+# คำนำหน้าที่บอกว่าเป็นรหัสของผู้ใช้ ไม่ใช่เลขอ้างอิงของเอกสาร
+NON_ID_CONTEXT_RE = re.compile(r"(ห้อง|อาคาร|ตึก|ชั้น|รุ่น|โซน|ล็อก|แบบฟอร์ม|เลขที่)\s*$")
 LABEL_RE = re.compile(r"\[(ยืนยันแล้ว|ข้อสมมติ|รอตัดสินใจ)([^\]]*)\]")
+LABEL_LIKE_RE = re.compile(r"[\[(（]\s*(ยืนยัน|ข้อสมมติ|สมมติ|รอตัดสินใจ|รอการตัดสินใจ)[^\])）]*[\])）]")
+T_LIST_RE = re.compile(r"^\s+T-\d{2,3}(\s*,\s*T-\d{2,3})*\s*$")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
-SKIP_PREFIXES = ("99", "09a")
+SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
+HEADING_RE = re.compile(r"^#{1,6}\s+")
+
+
+def cells(row: str) -> list:
+    row = row.strip().replace("\\|", "")
+    if row.startswith("|"):
+        row = row[1:]
+    if row.endswith("|"):
+        row = row[:-1]
+    return row.split("|")
 
 
 def main() -> int:
@@ -51,75 +98,169 @@ def main() -> int:
         print("ใช้: python check_blueprint.py <โฟลเดอร์ *-blueprint>")
         return 2
     folder = Path(sys.argv[1])
-    files = sorted(p for p in folder.glob("*.md"))
+    files = sorted(folder.glob("*.md"))
     if not files:
         print(f"ไม่พบไฟล์ .md ใน {folder}")
         return 2
 
-    by_num = {p.name[:2]: p for p in files if not p.name.startswith(SKIP_PREFIXES)}
-    full_mode = "05" in by_num or "07" in by_num or "11" in by_num or "12" in by_num
-    mode_idx = 0 if full_mode else 1
-
     errors, warnings = [], []
-    defined = {}  # id -> file
+    known_names = {v: k for k, v in FILES.items()}
+    by_num = {}
+    for p in files:
+        if APPENDIX_RE.match(p.name):
+            continue
+        if p.name in known_names:
+            by_num[known_names[p.name]] = p
+        else:
+            warnings.append(f"{p.name} ไม่ใช่ชื่อไฟล์มาตรฐานของชุด จึงไม่ได้ตรวจ")
+
+    present_full_only = SHORT_ONLY_MISSING & by_num.keys()
+    if not present_full_only:
+        mode = "ฉบับย่อ"
+        required = set(FILES) - SHORT_ONLY_MISSING
+    elif present_full_only == SHORT_ONLY_MISSING:
+        mode = "ฉบับเต็ม"
+        required = set(FILES)
+    else:
+        mode = "อัปเกรดค้างอยู่"
+        required = set(FILES)
+    for num in sorted(required - by_num.keys()):
+        errors.append(f"ไม่พบไฟล์ {FILES[num]} ซึ่ง{mode if mode != 'อัปเกรดค้างอยู่' else 'ฉบับเต็ม'}ต้องมี")
+
+    def home_of(letter: str) -> str:
+        full, short = HOME[letter]
+        return full if full in by_num else short
+
+    defined = {}  # id -> where
     refs = {}  # id -> set(files)
+    undefined_soft = set()  # id ที่ดูเป็นรหัสของผู้ใช้
+    decided_t = set()
     labels = {"ยืนยันแล้ว": 0, "ข้อสมมติ": 0, "รอตัดสินใจ": 0}
 
-    for num, path in by_num.items():
+    for num, path in sorted(by_num.items()):
         text = path.read_text(encoding="utf-8")
-        in_table = False
-        in_fence = False
-        for lineno, line in enumerate(text.splitlines(), 1):
+        lines = text.splitlines()
+        fence = None
+        in_decided = False
+        in_bare_table = False
+        for idx, line in enumerate(lines):
+            lineno = idx + 1
             where = f"{path.name}:{lineno}"
 
-            if FENCE_RE.match(line):
-                if not in_fence:
-                    errors.append(f"{where} มีบล็อกโค้ด (```) ในเอกสารหลัก")
-                in_fence = not in_fence
+            m = FENCE_RE.match(line)
+            if m:
+                if fence is None:
+                    fence = m.group(1)
+                    errors.append(f"{where} มีบล็อกโค้ด ({fence}) ในเอกสารหลัก")
+                elif m.group(1) == fence:
+                    fence = None
+                continue
 
             stripped = line.strip()
-            if stripped.startswith("|"):
-                if not in_table:
-                    cols = len(stripped.strip("|").split("|"))
-                    if cols > 5:
-                        errors.append(f"{where} ตารางมี {cols} คอลัมน์ (เกิน 5)")
-                in_table = True
-            else:
-                in_table = False
+            is_heading = bool(HEADING_RE.match(stripped))
+            if is_heading and num == "13":
+                in_decided = "ตัดสินใจแล้ว" in stripped and not re.search(r"T-\d", stripped)
 
-            for m in LABEL_RE.finditer(line):
-                kind, rest = m.group(1), m.group(2)
-                labels[kind] += 1
-                if kind == "รอตัดสินใจ" and not re.search(r"T-\d{2,3}", rest):
+            # ตาราง: ตรวจทุกแถว ทั้งแบบมีและไม่มี | นำหน้า
+            nxt = lines[idx + 1] if idx + 1 < len(lines) else ""
+            if "|" not in stripped:
+                in_bare_table = False
+            elif SEP_RE.match(stripped) and not stripped.startswith("|"):
+                in_bare_table = True
+            is_row = stripped.startswith("|") or (
+                "|" in stripped and (in_bare_table or SEP_RE.match(nxt))
+            )
+            if is_row and not SEP_RE.match(stripped):
+                n = len(cells(stripped))
+                if n > 5:
+                    errors.append(f"{where} แถวตารางมี {n} คอลัมน์ (เกิน 5)")
+            if SEP_RE.match(stripped) and not stripped.startswith("|"):
+                warnings.append(f"{where} ตารางไม่มี | นำหน้า อาจแสดงผลเพี้ยนเมื่อวางลง Word")
+
+            line_labels = list(LABEL_RE.finditer(line))
+            canonical_spans = []
+            for lm in line_labels:
+                kind, rest = lm.group(1), lm.group(2)
+                ok = (kind != "รอตัดสินใจ" and rest == "") or (
+                    kind == "รอตัดสินใจ" and T_LIST_RE.match(rest)
+                )
+                if kind == "รอตัดสินใจ" and rest.strip() == "T-xx" and num in NOT_COUNTED:
+                    canonical_spans.append(lm.span())  # คำอธิบายป้ายใน README/ศัพท์
+                    continue
+                if ok:
+                    canonical_spans.append(lm.span())
+                    if num not in NOT_COUNTED:
+                        labels[kind] += 1
+                elif kind == "รอตัดสินใจ" and not re.search(r"T-\d{2,3}", rest):
                     errors.append(f"{where} ป้าย [รอตัดสินใจ] ไม่มีเลข T-xx")
-
-            for m in ID_RE.finditer(line):
-                rid = f"{m.group(1)}-{m.group(2)}"
-                home = HOME[m.group(1)][mode_idx]
-                if num == home:
-                    defined.setdefault(rid, where)
+                    canonical_spans.append(lm.span())
                 else:
+                    errors.append(f"{where} ป้ายผิดรูปแบบ: {lm.group(0)}")
+                    canonical_spans.append(lm.span())
+            for bm in LABEL_LIKE_RE.finditer(line):
+                if not any(s <= bm.start() < e for s, e in canonical_spans):
+                    errors.append(f"{where} ป้ายผิดรูปแบบ: {bm.group(0)} (ใช้ [ยืนยันแล้ว] [ข้อสมมติ] [รอตัดสินใจ T-xx])")
+
+            for bm in BAD_ID_RE.finditer(line):
+                warnings.append(f"{where} {bm.group(0)} ดูเหมือนเลขอ้างอิงแต่ไม่ใช่เลขสองหลัก")
+
+            first_cell = cells(stripped)[0].strip() if stripped.startswith("|") else ""
+            for m in ID_RE.finditer(line):
+                letter = m.group(1)
+                rid = f"{letter}-{m.group(2)}"
+                is_decl_pos = (
+                    num == home_of(letter)
+                    and (
+                        (first_cell and re.match(rf"^\**{re.escape(rid)}(?![0-9])", first_cell))
+                        or (is_heading and re.match(rf"^#{{1,6}}\s+\**{re.escape(rid)}(?![0-9])", stripped))
+                    )
+                )
+                if is_decl_pos:
+                    if rid in defined:
+                        errors.append(f"{where} {rid} ประกาศซ้ำ (ครั้งแรกที่ {defined[rid]}) ห้ามใช้เลขซ้ำ")
+                        continue
+                    defined[rid] = where
+                    if in_decided and letter == "T":
+                        decided_t.add(rid)
+                    if (
+                        letter not in NO_LABEL_NEEDED
+                        and not line_labels
+                        and not LABEL_LIKE_RE.search(line)
+                        and "ยกเลิก" not in line
+                    ):
+                        warnings.append(f"{where} {rid} ไม่มีป้ายสถานะในบรรทัดที่ประกาศ")
+                else:
+                    if NON_ID_CONTEXT_RE.search(line[: m.start()]):
+                        undefined_soft.add(rid)
                     refs.setdefault(rid, set()).add(path.name)
 
     for rid, srcs in sorted(refs.items()):
-        letter = rid[0]
-        home = HOME[letter][mode_idx]
         if rid in defined:
             continue
-        if home not in by_num:
-            errors.append(f"{rid} ถูกอ้างใน {', '.join(sorted(srcs))} แต่ไม่มีไฟล์หลัก {home}")
-        else:
-            errors.append(
-                f"{rid} ถูกอ้างใน {', '.join(sorted(srcs))} แต่ไม่มีในไฟล์หลัก {by_num[home].name}"
+        home = home_of(rid[0])
+        src = ", ".join(sorted(srcs))
+        if rid in undefined_soft:
+            warnings.append(
+                f"{rid} ใน {src} ไม่ได้ประกาศในไฟล์หลัก ถ้าเป็นรหัสของผู้ใช้ (เช่น เลขห้อง) ไม่ต้องแก้"
             )
+        elif home not in by_num:
+            errors.append(f"{rid} ถูกอ้างใน {src} แต่ไม่มีไฟล์หลัก {FILES[home]}")
+        else:
+            errors.append(f"{rid} ถูกอ้างใน {src} แต่ไม่ได้ประกาศในไฟล์หลัก {FILES[home]}")
 
     for rid, where in sorted(defined.items()):
-        if rid[0] in SHOULD_BE_REFERENCED and rid not in refs:
+        if rid[0] not in SHOULD_BE_REFERENCED or rid in decided_t:
+            continue
+        # เกณฑ์เสร็จ (A) อ้างถึงได้จากเมทริกซ์สอบกลับที่อยู่ในไฟล์เดียวกัน
+        own = set() if rid[0] == "A" else {where.split(":")[0]}
+        if not (refs.get(rid, set()) - own):
             warnings.append(f"{rid} ({where}) ไม่มีไฟล์อื่นอ้างถึงเลย ตรวจว่าตกหล่นหรือไม่")
 
     total = sum(labels.values())
-    print(f"โหมดที่ตรวจพบ: {'ฉบับเต็ม' if full_mode else 'ฉบับย่อ'} · ไฟล์ที่ตรวจ {len(by_num)} ไฟล์")
-    print(f"ป้ายสถานะ: ยืนยันแล้ว {labels['ยืนยันแล้ว']} · ข้อสมมติ {labels['ข้อสมมติ']} · รอตัดสินใจ {labels['รอตัดสินใจ']}")
+    print(f"โหมดที่ตรวจพบ: {mode} · ไฟล์ที่ตรวจ {len(by_num)} ไฟล์")
+    if mode == "อัปเกรดค้างอยู่":
+        print("  ไฟล์ฉบับเต็มยังไม่ครบ: " + ", ".join(FILES[n] for n in sorted(SHORT_ONLY_MISSING - by_num.keys())))
+    print(f"ป้ายสถานะ (ไม่นับ 00, 14): ยืนยันแล้ว {labels['ยืนยันแล้ว']} · ข้อสมมติ {labels['ข้อสมมติ']} · รอตัดสินใจ {labels['รอตัดสินใจ']}")
     if total:
         pct = 100 * labels["ข้อสมมติ"] / total
         flag = "  ← เกิน 40% ต้องเขียนคำเตือนใน 00-readme" if pct > 40 else ""
