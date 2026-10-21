@@ -33,6 +33,7 @@ notes = []     # ข้อความแจ้งทั่วไป
 manifest = {}  # mode ที่อ่านได้จาก blueprint.json ใช้ตรวจ README
 BASE_ROLES = {"source", "overview", "features", "flows", "decisions", "development_plan", "acceptance"}
 TECH_ROLES = {"architecture", "data_model", "api"}
+COMPACT_GROUPS = ({"overview", "features"}, {"acceptance", "development_plan"})
 DECISION_STATUSES = {"ตัดสินใจแล้ว", "ใช้ค่าที่เสนอไปก่อน รอยืนยันกับลูกค้า", "รอตัดสินใจ"}
 
 
@@ -167,6 +168,10 @@ def check_manifest(root):
     manifest["mode"] = mode
     if mode not in ("business", "full"):
         err("blueprint.json", 0, "mode ต้องเป็น business หรือ full")
+    style = config.get("document_style", "standard")
+    if style not in ("standard", "compact"):
+        err("blueprint.json", 0, "document_style ต้องเป็น standard หรือ compact")
+    manifest["document_style"] = style
     documents = config.get("documents")
     if not isinstance(documents, dict):
         err("blueprint.json", 0, "documents ต้องเป็น object บทบาท: path")
@@ -211,7 +216,11 @@ def check_manifest(root):
             err("blueprint.json", 0, f"path ชี้ออกนอกโครงการ: {value}")
             return False
         if value in registered:
-            err("blueprint.json", 0, f"path ในทะเบียนซ้ำ: {value}")
+            shared_roles = {role for role, target in documents.items() if target == value}
+            allowed = (folder == "docs" and style == "compact" and
+                       any(shared_roles <= group for group in COMPACT_GROUPS))
+            if not allowed:
+                err("blueprint.json", 0, f"path ในทะเบียนซ้ำ: {value}; compact รวมได้เฉพาะ overview/features หรือ acceptance/development_plan")
         registered.add(value)
         if not (root / value).is_file():
             err("blueprint.json", 0, f"ไม่พบไฟล์ในทะเบียน: {value}")

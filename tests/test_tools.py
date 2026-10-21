@@ -50,7 +50,7 @@ class ProjectCase(unittest.TestCase):
         self.save()
 
     def add_document(self, role, stem, text):
-        number = len(self.manifest["documents"])
+        number = len(set(self.manifest["documents"].values()))
         path = "docs/{:02d}-{}.md".format(number, stem)
         self.manifest["documents"][role] = path
         (self.root / path).write_text(text, encoding="utf-8")
@@ -365,6 +365,100 @@ class CheckDocsTests(ProjectCase):
     def test_shorter_fence_cannot_close_longer_fence(self):
         self.document("overview").write_text("# Overview\nContract:\n````json\n{}\n```\n", encoding="utf-8")
         self.run_check(1)
+
+
+class CompactManifestTests(ProjectCase):
+    def compact(self):
+        source = self.document("source").read_text(encoding="utf-8")
+        # Rebuild only this test's temporary fixture, with unique numbering per shared file.
+        for path in (self.root / "docs").glob("*.md"):
+            path.unlink()
+        self.manifest["document_style"] = "compact"
+        self.manifest["documents"] = {
+            "source": "docs/00-source.md",
+            "overview": "docs/01-scope.md",
+            "features": "docs/01-scope.md",
+            "flows": "docs/02-flows.md",
+            "decisions": "docs/03-decisions.md",
+            "acceptance": "docs/04-delivery.md",
+            "development_plan": "docs/04-delivery.md",
+        }
+        for role, content in (
+            ("source", source),
+            ("overview", "# Scope\n## 1. Goal\nTrack equipment loans.\n## 2. Features\n- 2.1 Request a loan through Flow 1.\n"),
+            ("flows", "# Flows\n## Flow 1: Request\nBorrower requests; manager approves. See 01-scope.md ข้อ 2.1.\n"),
+            ("decisions", "# Decisions\nNo unresolved proposals in this fixture.\n"),
+            ("acceptance", "# Delivery\n## 1. Acceptance\nBorrower requests a loan.\n## 2. Plan\nBuild and review equipment loans.\n"),
+        ):
+            self.document(role).write_text(content, encoding="utf-8")
+        self.save()
+
+    def test_compact_shares_only_approved_roles_and_checks_flow_references(self):
+        self.compact()
+        self.assertIn("เตือน (0)", self.run_check(0))
+        self.assertEqual(len(list((self.root / "docs").glob("*.md"))), 5)
+        self.document("overview").write_text("# Scope\nSee Flow 99.\n", encoding="utf-8")
+        self.run_check(1)
+
+    def test_standard_still_rejects_compact_shared_paths(self):
+        self.compact()
+        del self.manifest["document_style"]
+        self.save()
+        self.run_check(1)
+
+    def test_compact_cannot_hide_source_or_decisions_in_another_role(self):
+        self.compact()
+        for role in ("source", "decisions", "flows", "screens"):
+            with self.subTest(role=role):
+                original = self.manifest["documents"].get(role)
+                self.manifest["documents"][role] = self.manifest["documents"]["overview"]
+                self.save()
+                self.assertIn("path ในทะเบียนซ้ำ", self.run_check(1))
+                if original is None:
+                    del self.manifest["documents"][role]
+                else:
+                    self.manifest["documents"][role] = original
+
+    def test_compact_still_requires_every_core_role(self):
+        self.compact()
+        del self.manifest["documents"]["features"]
+        self.save()
+        self.assertIn("features", self.run_check(1))
+
+    def test_invalid_document_style_is_reported_without_traceback(self):
+        for style in ("tiny", None, [], True):
+            with self.subTest(style=style):
+                self.manifest["document_style"] = style
+                self.save()
+                self.assertIn("document_style", self.run_check(1))
+
+    def test_full_upgrade_preserves_compact_files_and_references(self):
+        self.compact()
+        before = dict(self.manifest["documents"])
+        self.upgrade()
+        self.run_check(0)
+        for role, path in before.items():
+            self.assertEqual(self.manifest["documents"][role], path)
+        self.assertEqual(self.manifest["documents"]["architecture"], "docs/05-architecture.md")
+
+    def test_compact_full_still_requires_api_or_explicit_omission(self):
+        self.compact()
+        self.upgrade(api=False)
+        self.run_check(0)
+        del self.manifest["omissions"]["api"]
+        self.save()
+        self.run_check(1)
+
+    def test_bulk_replacement_preserves_compact_source_and_changes_shared_file_once(self):
+        self.compact()
+        source_before = self.document("source").read_bytes()
+        edits = self.root / "edits.json"
+        edits.write_text(json.dumps([{"file": "*", "find": "equipment", "replace": "asset", "count": 2}]), encoding="utf-8")
+        result = run_tool(REPLACE, self.root, edits)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.document("source").read_bytes(), source_before)
+        self.assertIn("asset", self.document("overview").read_text(encoding="utf-8"))
+        self.assertIn("asset", self.document("acceptance").read_text(encoding="utf-8"))
 
 
 class ReplacementTests(ProjectCase):
