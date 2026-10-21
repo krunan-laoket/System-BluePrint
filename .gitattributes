@@ -1,0 +1,3 @@
+# Keep LF in the repository and in checkouts on macOS and Windows alike
+* text=auto eol=lf
+*.png binary

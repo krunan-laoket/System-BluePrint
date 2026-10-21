@@ -5,14 +5,16 @@
 ถ้ารายการใดหาไม่เจอ หรือจำนวนจุดไม่ตรงกับที่ระบุ สคริปต์จะไม่เขียนไฟล์ใดเลย เพื่อไม่ให้แก้ไปครึ่งเดียว
 
 วิธีใช้:
-    python replace_checked.py <โฟลเดอร์โครงการ> <ไฟล์รายการแก้.json> [--dry-run]
+    python3 replace_checked.py <โฟลเดอร์โครงการ> <ไฟล์รายการแก้.json> [--dry-run]   (macOS/Linux)
+    py -3 replace_checked.py <โฟลเดอร์โครงการ> <ไฟล์รายการแก้.json> [--dry-run]     (Windows หรือใช้ python)
 
 ไฟล์รายการแก้เป็น JSON แบบ UTF-8 เป็นรายการของ
     {"file": "docs/03-flows.md", "find": "ข้อความเดิม", "replace": "ข้อความใหม่", "count": 2}
 
     file     ตำแหน่งไฟล์จากโฟลเดอร์โครงการ หรือ "*" หมายถึง README.md และทุกไฟล์ .md ใน docs/ และ plans/
              ยกเว้นบทบาท source ใน blueprint.json (ชุดเก่าที่ไม่มีทะเบียนยกเว้นชื่อ 00-)
-    find     ข้อความเดิม ต้องตรงทุกตัวอักษร
+    find     ข้อความเดิม ต้องตรงทุกตัวอักษร (ขึ้นบรรทัดใช้ \n ได้ทั้งไฟล์ CRLF และ LF ไฟล์ยังคงแบบเดิม
+             ไฟล์ที่ขึ้นบรรทัดปนกันจะใช้แบบที่มีมากกว่า)
     replace  ข้อความใหม่
     count    จำนวนจุดที่ต้องพบ ถ้าไม่ระบุ: ไฟล์เดียวต้องพบ 1 จุดพอดี ส่วน "*" ต้องพบอย่างน้อย 1 จุดรวมทุกไฟล์
 
@@ -23,6 +25,7 @@ Python 3.9+ ใช้ไลบรารีมาตรฐาน
 รหัสออก: 0 = สำเร็จ, 1 = ตรวจรายการไม่ผ่านหรือเขียนไม่สำเร็จ, 2 = เรียกใช้ผิด
 """
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -41,7 +44,7 @@ def all_docs(root):
             files.extend(sorted((root / sub).rglob("*.md")))
     manifest = root / "blueprint.json"
     if manifest.is_file():
-        config = json.loads(manifest.read_text(encoding="utf-8"))
+        config = json.loads(manifest.read_text(encoding="utf-8-sig"))
         source = config["documents"]["source"]
         if not isinstance(source, str):
             raise ValueError("source ในทะเบียนต้องเป็น path")
@@ -62,7 +65,8 @@ def main():
         print(f"ไม่พบโฟลเดอร์โครงการ: {root}")
         return 2
     try:
-        edits = json.loads(Path(args[1]).read_text(encoding="utf-8"))
+        # utf-8-sig รับไฟล์ที่มี BOM (เช่น บันทึกจาก Notepad บน Windows) ได้
+        edits = json.loads(Path(args[1]).read_text(encoding="utf-8-sig"))
     except Exception as e:
         print(f"อ่านไฟล์รายการแก้ไม่ได้: {e}")
         return 2
@@ -70,11 +74,21 @@ def main():
         print("ไฟล์รายการแก้ต้องเป็นรายการ (list)")
         return 2
 
-    content = {}  # path -> ข้อความปัจจุบันในหน่วยความจำ
+    content = {}   # path -> ข้อความปัจจุบันในหน่วยความจำ (ขึ้นบรรทัดด้วย \n เสมอ)
+    original = {}  # path -> (ข้อความเดิม, ตัวขึ้นบรรทัดเดิม)
 
     def load(p):
         if p not in content:
-            content[p] = p.read_text(encoding="utf-8")
+            # newline="" อ่านตามจริง แล้วจำว่าไฟล์ใช้ CRLF (Windows) หรือ LF (macOS/Linux)
+            # เพื่อให้ find ที่มี \n ตรงทั้งสองแบบ และเขียนกลับด้วยแบบเดิมของไฟล์
+            with p.open("r", encoding="utf-8", newline="") as handle:
+                raw = handle.read()
+            crlf = raw.count("\r\n")
+            # ไฟล์ที่ขึ้นบรรทัดปนกันจะใช้แบบที่มีมากกว่า ไม่ให้บรรทัด CRLF หลงมาบรรทัดเดียวเปลี่ยนทั้งไฟล์
+            eol = "\r\n" if crlf > raw.count("\n") - crlf else "\n"
+            text = raw.replace("\r\n", "\n")
+            content[p] = text
+            original[p] = (text, eol)
         return content[p]
 
     problems = []
@@ -105,10 +119,17 @@ def main():
             if not p.is_file():
                 problems.append(f"รายการที่ {n}: ไม่พบไฟล์ {target}")
                 continue
+            # macOS/Windows ไม่สนตัวพิมพ์ ชื่อที่พิมพ์ต่างจากไฟล์จริงจะกลายเป็นอีกกุญแจหนึ่งและทับผลแก้กันได้
+            if p.name not in os.listdir(p.parent):
+                problems.append(f"รายการที่ {n}: ตัวพิมพ์ของชื่อไฟล์ไม่ตรงกับไฟล์จริง {target}")
+                continue
             paths = [p]
+        # ใช้ path ที่ resolve แล้วเป็นกุญแจเดียว ไม่ให้ไฟล์เดียวกันถูกโหลดสองชุดจาก "*" และชื่อไฟล์ตรง
+        # (ถ้าโหลดสองชุด การเขียนชุดหลังจะทับผลแก้ของชุดแรก)
+        paths = [p.resolve() for p in paths]
         try:
             for p in paths:
-                p.resolve().relative_to(root)
+                p.relative_to(root)
                 if p.suffix != ".md":
                     raise ValueError("แก้ได้เฉพาะไฟล์ Markdown")
             hits = {p: load(p).count(find) for p in paths}
@@ -144,10 +165,11 @@ def main():
     changed = 0
     try:
         for p, text in content.items():
-            if text != p.read_text(encoding="utf-8"):
-                # Path.write_text(newline=...) requires Python 3.10; open supports 3.9.
-                with p.open("w", encoding="utf-8", newline="\n") as handle:
-                    handle.write(text)
+            before, eol = original[p]
+            if text != before:
+                # newline="" ไม่แปลงอะไรเพิ่ม จึงคงตัวขึ้นบรรทัดเดิมของไฟล์ไว้ (Path.write_text(newline=) ต้องใช้ 3.10)
+                with p.open("w", encoding="utf-8", newline="") as handle:
+                    handle.write(text.replace("\n", eol))
                 changed += 1
     except OSError as exc:
         print(f"เขียนไม่สำเร็จหลังแก้ {changed} ไฟล์: {exc}; ตรวจไฟล์ที่แก้แล้วก่อนลองใหม่")

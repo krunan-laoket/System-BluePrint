@@ -13,6 +13,13 @@ from unittest.mock import patch
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 CHECK = SKILL_ROOT / "scripts" / "check_docs.py"
 REPLACE = SKILL_ROOT / "scripts" / "replace_checked.py"
+EXAMPLE = SKILL_ROOT / "examples" / "lab-equipment-loan"
+
+
+def run_tool(script, *args):
+    # Decode output as UTF-8 explicitly: a Thai Windows console defaults to cp874, macOS to UTF-8.
+    return subprocess.run([sys.executable, str(script), *map(str, args)],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
 class ProjectCase(unittest.TestCase):
@@ -57,7 +64,7 @@ class ProjectCase(unittest.TestCase):
         (self.root / "README.md").write_text("# Project\nblueprint.json\n" + "".join("- " + p + "\n" for p in paths), encoding="utf-8")
 
     def run_check(self, expected):
-        result = subprocess.run([sys.executable, str(CHECK), str(self.root)], capture_output=True, text=True)
+        result = run_tool(CHECK, self.root)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         return result.stdout
@@ -150,7 +157,7 @@ class CheckDocsTests(ProjectCase):
 
     def test_readme_link_does_not_fall_back_to_docs(self):
         readme = self.root / "README.md"
-        readme.write_text(readme.read_text() + "\n[Source](00-source.md)\n", encoding="utf-8")
+        readme.write_text(readme.read_text(encoding="utf-8") +"\n[Source](00-source.md)\n", encoding="utf-8")
         self.run_check(1)
 
     def test_malformed_link_is_reported_without_crash(self):
@@ -223,7 +230,7 @@ class CheckDocsTests(ProjectCase):
     def test_summary_status_mismatch_fails(self):
         self.decision("รอตัดสินใจ")
         p = self.document("decisions")
-        p.write_text(p.read_text().replace("| 1 | Duration | รอตัดสินใจ", "| 1 | Duration | ตัดสินใจแล้ว"), encoding="utf-8")
+        p.write_text(p.read_text(encoding="utf-8").replace("| 1 | Duration | รอตัดสินใจ", "| 1 | Duration | ตัดสินใจแล้ว"), encoding="utf-8")
         self.run_check(1)
 
     def test_summary_cannot_list_decision_without_details(self):
@@ -252,6 +259,109 @@ class CheckDocsTests(ProjectCase):
         self.document("overview").write_text("# Overview\nExample contract:\n````markdown\n```json\n{}\n```\n````\n", encoding="utf-8")
         self.run_check(0)
 
+    def test_windows_bom_and_crlf_files_pass(self):
+        manifest = self.root / "blueprint.json"
+        manifest.write_bytes(b"\xef\xbb\xbf" + manifest.read_bytes())
+        self.document("overview").write_bytes("﻿# Overview\r\n## 1. Goal\r\nTrack loans.\r\n".encode("utf-8"))
+        self.document("features").write_text("# Features\nSee 01-overview.md ข้อ 1.\n", encoding="utf-8")
+        self.run_check(0)
+
+    def overview(self, body):
+        self.document("overview").write_text("# Overview\n## 1. Goal\n" + body + "\n", encoding="utf-8")
+
+    def test_thai_glued_to_file_name_is_not_part_of_it(self):
+        # Python's \w matches Thai letters; Thai text is written without spaces.
+        self.overview("รายละเอียดอยู่ใน02-features.md ข้อ 1.1 และดูใน03-flows.md")
+        self.run_check(0)
+
+    def test_thai_glued_missing_references_are_still_errors(self):
+        for content in ("ดู 99-ghost.mdและไฟล์อื่น", "ทำตามFlow 99", "ดูใน02-features.md ข้อ 9.9"):
+            with self.subTest(content=content):
+                self.overview(content)
+                self.run_check(1)
+
+    def test_every_number_in_a_reference_list_is_checked(self):
+        self.decision("รอตัดสินใจ")
+        for content in ("ดู Flow 1, 99", "ดู Flow 1 และ Flow 99", "ประเด็นที่ 1, 99", "ประเด็นที่ 1 และ 99",
+                        "02-features.md ข้อ 1 และข้อ 9", "02-features.md หัวข้อ 9.9",
+                        "[02-features.md](02-features.md) ข้อ 9.9"):
+            with self.subTest(content=content):
+                self.overview(content)
+                self.run_check(1)
+        self.overview("ดู Flow 1 และประเด็นที่ 1 และ 02-features.md ข้อ 1 และข้อ 1.1")
+        self.run_check(0)
+
+    def test_mixed_reference_kinds_in_one_list_are_not_confused(self):
+        self.decision("รอตัดสินใจ")
+        self.overview("ดู Flow 1, ประเด็นที่ 1 และ 02-features.md ข้อ 1.1, Flow 1")
+        self.assertIn("ผิดพลาด (0)", self.run_check(0))
+
+    def test_pending_mark_pointing_to_decided_issue_warns(self):
+        self.decision("ตัดสินใจแล้ว", "**ผู้ยืนยัน:** Owner\n**วันที่ยืนยัน:** 21 ตุลาคม 2569\n**หลักฐานยืนยัน:** Chat message.\n")
+        self.overview("ยืม 7 วัน (รอยืนยัน) ตามประเด็นที่ 1")
+        self.assertIn("ซึ่งตัดสินใจแล้ว", self.run_check(0))
+
+    def test_screen_total_must_match_rows(self):
+        self.add_document("screens", "screens",
+                          "# Screens\n## 1. Borrower\n| # | Screen | Priority |\n|---|---|---|\n"
+                          "| 1 | Search | must |\n| 2 | My loans | must |\n"
+                          "## 2. Summary\n| Side | Total |\n|---|---|\n| รวม | 3 |\n")
+        self.save()
+        self.assertIn("หน้าจอรวม 3", self.run_check(0))
+
+    def test_readme_mode_must_match_manifest(self):
+        readme = self.root / "README.md"
+        readme.write_text(readme.read_text(encoding="utf-8") + "| โหมดเอกสาร | โหมดครบวงจร |\n", encoding="utf-8")
+        self.assertIn("README ระบุโหมดครบวงจร", self.run_check(0))
+
+    def test_api_path_in_business_mode_warns(self):
+        self.overview("ส่งคำร้องผ่าน `POST /api/v1/complaints`")
+        self.assertIn("โหมด business ไม่ควรมี API path", self.run_check(0))
+
+    def test_section_level_pending_mark_counts_as_mark(self):
+        self.document("features").write_text(
+            "# Features\n## 1. Borrower (ทั้งหมวดรอยืนยัน)\n- 1.1 Request.\n", encoding="utf-8")
+        self.assertIn("ไม่ได้ชี้ไปที่ไฟล์ประเด็นตัดสินใจ", self.run_check(0))
+
+    def test_bold_or_dotted_list_numbers_are_referable(self):
+        self.document("features").write_text(
+            "# Features\n## 1. Borrower\n- **1.2** Cancel.\n- 1.3. Return.\n", encoding="utf-8")
+        self.overview("02-features.md ข้อ 1.2 และข้อ 1.3")
+        self.run_check(0)
+
+    def test_reference_case_must_match_real_file(self):
+        self.overview("ดู 02-FEATURES.md")
+        self.run_check(1)
+
+    def test_numbered_option_table_and_extra_summary_column_are_allowed(self):
+        self.decision("รอตัดสินใจ", details=(
+            "**ที่มา:** Source did not specify.\n"
+            "**ทางเลือกและผลกระทบ**\n"
+            "| # | ทางเลือก | ระยะเวลา |\n|---|---|---|\n| 1 | 7 days | short |\n| 2 | 14 days | long |\n"
+            "**ค่าที่ใช้ในเอกสาร / คำแนะนำของทีม:** 7 days\n"
+            "**ผลกระทบเมื่อคำตอบเปลี่ยน:** Flow 1\n"))
+        p = self.document("decisions")
+        p.write_text(p.read_text(encoding="utf-8")
+                     .replace("| # | Topic | Status |\n|---|---|---|", "| # | Topic | ขวางการพัฒนา | สถานะ |\n|---|---|---|---|")
+                     .replace("| 1 | Duration | รอตัดสินใจ |", "| 1 | Duration | ใช่ | รอตัดสินใจ |"),
+                     encoding="utf-8")
+        self.run_check(0)
+
+    def test_non_ascii_digit_in_summary_does_not_crash(self):
+        self.document("decisions").write_text(
+            "# Decisions\n| # | Topic | Status |\n|---|---|---|\n| ① | Duration | รอตัดสินใจ |\n", encoding="utf-8")
+        self.run_check(0)
+
+    def test_legitimate_angle_brackets_and_front_matter_do_not_warn(self):
+        self.overview("ดู <https://www.pdpc.or.th> หรือ <dpo@example.com>\n<!-- note -->\n"
+                      "ค่าที่ยอมรับ < 3 วินาที และ > 99%\n"
+                      "```mermaid\n---\ntitle: Loan\n---\nflowchart TD\nA-->B\n```")
+        self.assertIn("เตือน (0)", self.run_check(0))
+
+    def test_unexpanded_role_with_digits_fails(self):
+        self.overview("ดู {{integration_line2}}")
+        self.run_check(1)
+
     def test_shorter_fence_cannot_close_longer_fence(self):
         self.document("overview").write_text("# Overview\nContract:\n````json\n{}\n```\n", encoding="utf-8")
         self.run_check(1)
@@ -261,7 +371,7 @@ class ReplacementTests(ProjectCase):
     def run_replace(self, edits, *flags):
         edit_path = self.root / "edits.json"
         edit_path.write_text(json.dumps(edits), encoding="utf-8")
-        return subprocess.run([sys.executable, str(REPLACE), str(self.root), str(edit_path), *flags], capture_output=True, text=True)
+        return run_tool(REPLACE, self.root, edit_path, *flags)
 
     def snapshot(self):
         return {p: p.read_bytes() for p in self.root.rglob("*.md")}
@@ -310,7 +420,73 @@ class ReplacementTests(ProjectCase):
         result = self.run_replace([{"file": "*", "find": "equipment", "replace": "asset"}])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.document("source").read_bytes(), source_data)
-        self.assertIn("asset", self.document("overview").read_text())
+        self.assertIn("asset", self.document("overview").read_text(encoding="utf-8"))
+
+    def test_line_endings_are_preserved_and_multiline_find_matches_crlf(self):
+        crlf = self.document("overview")
+        lf = self.document("features")
+        crlf.write_bytes(b"# Overview\r\n## 1. Goal\r\nTrack equipment loans.\r\n")
+        lf.write_bytes(b"# Features\n## 1. Borrower\n- 1.1 Request an equipment loan.\n")
+        result = self.run_replace([{"file": "*", "find": "equipment", "replace": "asset"},
+                                   {"file": crlf.relative_to(self.root).as_posix(),
+                                    "find": "Goal\nTrack", "replace": "Purpose\nTrack"}])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(crlf.read_bytes(), b"# Overview\r\n## 1. Purpose\r\nTrack asset loans.\r\n")
+        self.assertEqual(lf.read_bytes(), b"# Features\n## 1. Borrower\n- 1.1 Request an asset loan.\n")
+
+    def test_wildcard_and_direct_edits_to_same_file_both_apply(self):
+        overview = self.document("overview")
+        result = self.run_replace([
+            {"file": "*", "find": "equipment", "replace": "asset"},
+            {"file": "./" + overview.relative_to(self.root).as_posix(), "find": "Goal", "replace": "Purpose"},
+        ])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        text = overview.read_text(encoding="utf-8")
+        self.assertIn("asset", text)
+        self.assertIn("Purpose", text)
+
+    def test_edit_file_with_bom_is_read(self):
+        edit_path = self.root / "edits.json"
+        edit_path.write_bytes(b"\xef\xbb\xbf" + json.dumps([{"file": "*", "find": "equipment", "replace": "asset"}]).encode())
+        result = run_tool(REPLACE, self.root, edit_path)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_one_stray_crlf_does_not_convert_whole_file(self):
+        overview = self.document("overview")
+        overview.write_bytes(b"# Overview\r\n## 1. Goal\nTrack equipment loans.\nMore.\n")
+        result = self.run_replace([{"file": "*", "find": "equipment", "replace": "asset"}])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(overview.read_bytes(), b"# Overview\n## 1. Goal\nTrack asset loans.\nMore.\n")
+
+    def test_wrong_case_target_never_loses_an_edit(self):
+        # Windows resolve() folds case to the real name; macOS does not, so the tool must reject the
+        # mismatched name there. Either outcome is fine; silently dropping one of the two edits is not.
+        before = self.snapshot()
+        overview = self.document("overview")
+        wrong = overview.relative_to(self.root).as_posix().replace("overview", "OVERVIEW")
+        result = self.run_replace([{"file": "*", "find": "equipment", "replace": "asset"},
+                                   {"file": wrong, "find": "Goal", "replace": "Purpose"}])
+        if result.returncode == 0:
+            text = overview.read_text(encoding="utf-8")
+            self.assertIn("asset", text)
+            self.assertIn("Purpose", text)
+        else:
+            self.assertEqual(self.snapshot(), before)
+
+    def test_manifest_with_utf8_bom_is_read(self):
+        manifest = self.root / "blueprint.json"
+        manifest.write_bytes(b"\xef\xbb\xbf" + manifest.read_bytes())
+        result = self.run_replace([{"file": "*", "find": "equipment", "replace": "asset"}])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("equipment", self.document("source").read_text(encoding="utf-8"))
+
+
+class ExampleTests(unittest.TestCase):
+    def test_bundled_example_passes_without_errors_or_warnings(self):
+        # The example is what the skill tells the AI to imitate, so it must satisfy every rule it teaches.
+        result = run_tool(CHECK, EXAMPLE)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("เตือน (0)", result.stdout, result.stdout)
 
 
 class RenderTests(unittest.TestCase):

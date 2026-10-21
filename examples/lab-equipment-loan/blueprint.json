@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "mode": "business",
+  "documents": {
+    "source": "docs/00-source.md",
+    "overview": "docs/01-overview.md",
+    "features": "docs/02-features.md",
+    "flows": "docs/03-flows.md",
+    "screens": "docs/04-screens.md",
+    "decisions": "docs/05-decisions.md",
+    "development_plan": "docs/06-development-plan.md",
+    "acceptance": "docs/07-acceptance.md"
+  },
+  "plans": ["plans/scope-confirmation-plan.md"],
+  "omissions": {}
+}
