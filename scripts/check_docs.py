@@ -518,25 +518,24 @@ def check_empty_sections(docs):
 
 LEGEND = re.compile(r"ข้อที่มี(?:คำว่า|เครื่องหมาย)")
 PENDING_MARK = re.compile(r"\([^()\n]*รอยืนยัน\)")  # (รอยืนยัน) หรือ (จำนวนรูปรอยืนยัน) ไม่รวมชื่อสถานะเช่น รอยืนยันผล
-CLIENT_MARK = re.compile(r"\(ลูกค้ากำหนด\)")
 
 
 def check_pending_marks(docs):
     decisions = [d for d in docs if d.role == "decisions"]
     marked = [
         d for d in docs
-        if (PENDING_MARK.search(d.text) or CLIENT_MARK.search(d.text))
+        if PENDING_MARK.search(d.text)
         and d.rel != "README.md"
         and d not in decisions
         and not is_source_doc(d)
     ]
     if marked and not decisions:
-        warn("docs/", 0, "มีเครื่องหมาย \"(รอยืนยัน)\" หรือ \"(ลูกค้ากำหนด)\" ในเอกสาร แต่ไม่พบไฟล์ประเด็นตัดสินใจ (ชื่อไฟล์ที่มีคำว่า decisions)")
+        warn("docs/", 0, "มีเครื่องหมาย \"(รอยืนยัน)\" ในเอกสาร แต่ทะเบียนไม่มีไฟล์บทบาท decisions")
         return
     names = [d.path.name for d in decisions]
     for d in marked:
         if not any(n in d.text for n in names) and "ประเด็นที่" not in d.text:
-            warn(d.rel, 0, "ไฟล์นี้มีเครื่องหมาย \"(รอยืนยัน)\" หรือ \"(ลูกค้ากำหนด)\" แต่ไม่ได้ชี้ไปที่ไฟล์ประเด็นตัดสินใจหรือเลขประเด็น ผู้อ่านจะหารายละเอียดไม่เจอ")
+            warn(d.rel, 0, "ไฟล์นี้มีเครื่องหมาย \"(รอยืนยัน)\" แต่ไม่ได้ชี้ไปที่ไฟล์ประเด็นตัดสินใจหรือเลขประเด็น ผู้อ่านจะหารายละเอียดไม่เจอ")
 
     # หลังโหมดอัปเดต เครื่องหมายรอยืนยันที่ชี้ไปประเด็นซึ่งตัดสินใจแล้วต้องถูกเอาออก
     decided = set()
